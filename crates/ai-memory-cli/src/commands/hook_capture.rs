@@ -35,11 +35,23 @@ pub fn capture_policy(cwd: &str) -> CapturePolicy {
     marker_capture_policy(&marker, cwd)
 }
 
-/// The capture policy one marker file declares; `cwd` stands in for its
-/// directory only when that cannot be read as text.
-pub(crate) fn marker_capture_policy(marker: &Path, cwd: &str) -> CapturePolicy {
+/// The capture policy one marker file declares for a lookup from `cwd`, its
+/// `ignore_paths` anchored at [`crate::marker::capture_anchor`].
+fn marker_capture_policy(marker: &Path, cwd: &str) -> CapturePolicy {
+    let anchor = crate::marker::capture_anchor(marker, Path::new(cwd));
+    anchored_capture_policy(marker, anchor.as_deref(), cwd)
+}
+
+/// The capture policy one marker file declares, its `ignore_paths` anchored
+/// at `anchor`; `cwd` stands in for the anchor only when that is unknown or
+/// cannot be read as text.
+pub(crate) fn anchored_capture_policy(
+    marker: &Path,
+    anchor: Option<&Path>,
+    cwd: &str,
+) -> CapturePolicy {
     let home = home_dir();
-    let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
+    let marker_dir = anchor.and_then(Path::to_str).unwrap_or(cwd);
     match read_capture_config(marker) {
         Ok(config) => CapturePolicy::resolve(
             CaptureSource::Parsed(&config),
@@ -130,7 +142,8 @@ pub fn capture_config_problem(cwd: &str) -> Option<(PathBuf, String)> {
     if capture_policy(cwd).state() != PolicyState::Invalid {
         return None;
     }
-    let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
+    let anchor = crate::marker::capture_anchor(&marker, Path::new(cwd));
+    let marker_dir = anchor.as_deref().and_then(Path::to_str).unwrap_or(cwd);
     let home = home_dir();
     let reason = match read_capture_config_verbose(&marker) {
         Err(reason) => reason,

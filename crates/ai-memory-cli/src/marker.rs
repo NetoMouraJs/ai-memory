@@ -979,7 +979,7 @@ pub(crate) fn find_marker(cwd: &str) -> Option<PathBuf> {
     find_marker_with_home(cwd, home.as_deref())
 }
 
-fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
     find_marker_matching(cwd, home, OutsideHome::StopAtCheckoutRoot, |path| {
         Some(path.to_path_buf())
     })
@@ -1021,10 +1021,76 @@ enum OutsideHome {
     WalkToRoot,
 }
 
+/// Directory at a checkout root that may hold the checkout's marker
+/// (`custom/ai-dir-marker`, fork only). Tooling overlays keep their files
+/// there, outside git, so a marker in it opts the checkout in without
+/// touching the tracked tree.
+pub(crate) const AI_DIR: &str = ".ai";
+
+/// The `.ai` markers a checkout rooted at `root` falls back to when its root
+/// holds no marker, in precedence order: the checkout's own
+/// `<root>/.ai/.ai-memory.toml`, then, for a linked worktree, the main
+/// checkout's (found through the shared git directory). Each existing one is
+/// offered to `matches`; the first it accepts wins.
+///
+/// The main checkout is looked up only when `<root>/.git` is a file, so a
+/// checkout with a root marker, or a plain clone, never opens the repository.
+fn ai_dir_marker_matching<T>(
+    root: &Path,
+    matches: &mut impl FnMut(&Path) -> Option<T>,
+) -> Option<T> {
+    let own = root.join(AI_DIR).join(MARKER_FILENAME);
+    if own.is_file()
+        && let Some(found) = matches(&own)
+    {
+        return Some(found);
+    }
+    if !root.join(".git").is_file() {
+        return None;
+    }
+    let main = ai_memory_consolidate::linked_worktree_main_root(root)?;
+    let shared = main.join(AI_DIR).join(MARKER_FILENAME);
+    if shared.is_file() {
+        return matches(&shared);
+    }
+    None
+}
+
+/// Whether `marker` is a checkout's `.ai` marker: it sits in the `.ai`
+/// directory of a checkout root. Such a marker governs from outside the tree
+/// it opts in (the main checkout's governs every linked worktree), so its
+/// `ignore_paths` are anchored at the checkout being inspected rather than at
+/// the marker's own directory — see [`capture_anchor`].
+pub(crate) fn is_ai_dir_marker(marker: &Path) -> bool {
+    marker.file_name() == Some(std::ffi::OsStr::new(MARKER_FILENAME))
+        && marker.parent().is_some_and(|dir| {
+            dir.file_name() == Some(std::ffi::OsStr::new(AI_DIR))
+                && dir.parent().is_some_and(|root| root.join(".git").exists())
+        })
+}
+
+/// The directory `marker`'s `[capture] ignore_paths` are anchored at for a
+/// lookup from `dir`: the marker's own directory, except for a `.ai` marker
+/// ([`is_ai_dir_marker`]), whose patterns are anchored at the root of the
+/// checkout holding `dir` — so the main checkout's `NuGet.Config` entry
+/// covers each worktree's own `NuGet.Config`, and never `<main>/.ai/NuGet.Config`.
+pub(crate) fn capture_anchor(marker: &Path, dir: &Path) -> Option<PathBuf> {
+    if is_ai_dir_marker(marker)
+        && let Some(root) = checkout_root(&absolute_normalized(dir))
+    {
+        return Some(root);
+    }
+    marker.parent().map(Path::to_path_buf)
+}
+
 /// Shared walk-up-from-`cwd`-toward-`$HOME` used by every marker lookup;
 /// `matches` maps a marker file found along the way to a result that stops
 /// the walk, or `None` to continue to the next ancestor. Inside `$HOME` the
 /// walk stops at `$HOME`; `outside_home` picks the stop for a start outside it.
+///
+/// At the root of the checkout holding `cwd`, when no marker there matched,
+/// the walk tries that checkout's `.ai` markers ([`ai_dir_marker_matching`])
+/// before going on: nested > root > own `.ai` > main checkout's `.ai`.
 fn find_marker_matching<T>(
     cwd: &str,
     home: Option<&Path>,
@@ -1033,10 +1099,11 @@ fn find_marker_matching<T>(
 ) -> Option<T> {
     let start = absolute_normalized(Path::new(cwd));
     let home = home.map(absolute_normalized);
+    let checkout = checkout_root(&start);
     let boundary = match (home.as_deref(), outside_home) {
         (Some(home), _) if start.starts_with(home) => Some(home.to_path_buf()),
         (Some(_), OutsideHome::StopAtCheckoutRoot) => {
-            Some(checkout_root(&start).unwrap_or_else(|| start.clone()))
+            Some(checkout.clone().unwrap_or_else(|| start.clone()))
         }
         (Some(_), OutsideHome::WalkToRoot) | (None, _) => None,
     };
@@ -1046,6 +1113,11 @@ fn find_marker_matching<T>(
         let candidate = dir.join(".ai-memory.toml");
         if candidate.is_file()
             && let Some(found) = matches(&candidate)
+        {
+            return Some(found);
+        }
+        if checkout.as_deref() == Some(dir)
+            && let Some(found) = ai_dir_marker_matching(dir, &mut matches)
         {
             return Some(found);
         }
@@ -1138,6 +1210,23 @@ impl MarkerMemo {
                 chain.push(current);
                 break Some(candidate);
             }
+            // As in `find_marker_matching`, the root of a checkout falls back
+            // to its `.ai` markers before the walk leaves it.
+            let in_no_checkout = current
+                .parent()
+                .is_some_and(|parent| matches!(self.checkouts.get(parent), Some(None)));
+            let at_checkout_root = self
+                .checkout_root(&current, spend)?
+                .is_some_and(|root| root == current);
+            if at_checkout_root {
+                spend()?;
+                if let Some(marker) =
+                    ai_dir_marker_matching(&current, &mut |path: &Path| Some(path.to_path_buf()))
+                {
+                    chain.push(current);
+                    break Some(marker);
+                }
+            }
             // The same boundary as `find_marker_matching`: `$HOME` for a
             // directory inside it, else the nearest `.git` root (the
             // directory itself outside any checkout), else the filesystem
@@ -1147,9 +1236,7 @@ impl MarkerMemo {
                 // Below a directory known to lie in no checkout, this one is
                 // a checkout root or in none: a boundary either way.
                 Some(_) => {
-                    current
-                        .parent()
-                        .is_some_and(|parent| matches!(self.checkouts.get(parent), Some(None)))
+                    in_no_checkout
                         || self
                             .checkout_root(&current, spend)?
                             .is_none_or(|root| root == current)
@@ -1181,6 +1268,10 @@ impl MarkerMemo {
     pub(crate) fn remember(&mut self, dir: &Path, marker: Option<&Path>) {
         let start = absolute_normalized(dir);
         let stop = match marker {
+            // A `.ai` marker was found at the checkout root's step.
+            Some(marker) if is_ai_dir_marker(marker) => {
+                self.checkouts.get(&start).cloned().flatten()
+            }
             Some(marker) => marker.parent().map(absolute_normalized),
             None => match self.home.as_deref() {
                 Some(home) if start.starts_with(home) => Some(home.to_path_buf()),
@@ -2731,5 +2822,305 @@ project = "infra" # this is fine
             Path::new(r"\\?\C:\work\team-b"),
             Path::new(r"D:\work\team-b\repo")
         ));
+    }
+}
+
+/// Real git checkouts for the `.ai` marker tests (`custom/ai-dir-marker`).
+#[cfg(test)]
+pub(crate) mod ai_dir_fixture {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Whether a `git` binary runs at all; the fixtures skip without one.
+    pub(crate) fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Run git in `dir` with a fixed identity, panicking on failure so a
+    /// broken fixture never passes as an empty one. `--no-gpg-sign` goes on
+    /// every commit: a global `commit.gpgsign = true` would sign as this
+    /// throwaway identity, and fail.
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A main checkout at `<parent>/main` with one commit, so worktrees can
+    /// be added; `None` without git.
+    pub(crate) fn main_checkout(parent: &Path) -> Option<PathBuf> {
+        if !git_available() {
+            return None;
+        }
+        let main = parent.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(
+            &main,
+            &[
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        Some(main)
+    }
+
+    /// A linked worktree of `main` at `path`, on a new branch `branch`.
+    pub(crate) fn add_worktree(main: &Path, path: &Path, branch: &str) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        git(
+            main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        path.to_path_buf()
+    }
+
+    /// The Glintt layout: a main checkout with a linked worktree at
+    /// `<main>/.ai/.local/worktrees/T-1`, which puts `<main>/.ai` among the
+    /// worktree's ancestors. `None` without git.
+    pub(crate) fn main_with_worktree(parent: &Path) -> Option<(PathBuf, PathBuf)> {
+        let main = main_checkout(parent)?;
+        let worktree = main
+            .join(".ai")
+            .join(".local")
+            .join("worktrees")
+            .join("T-1");
+        let worktree = add_worktree(&main, &worktree, "feat/t-1");
+        Some((main, worktree))
+    }
+
+    /// Write `body` to `path`, creating its directory.
+    pub(crate) fn write(path: &Path, body: &str) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        path.to_path_buf()
+    }
+
+    /// Whether two paths name the same existing file or directory, whatever
+    /// spelling each lookup produced (git reports `C:/…`, a walk `C:\…`).
+    pub(crate) fn same(left: &Path, right: &Path) -> bool {
+        left.exists() && std::fs::canonicalize(left).ok() == std::fs::canonicalize(right).ok()
+    }
+
+    /// Every home a walk can run under: one outside the tree (the walk stops
+    /// at the checkout root) and one above it (the walk goes on to `$HOME`,
+    /// through `<main>/.ai` itself in the Glintt layout).
+    pub(crate) fn homes(tmp: &Path) -> [PathBuf; 2] {
+        let outside = tmp.join("home");
+        std::fs::create_dir_all(&outside).unwrap();
+        [outside, tmp.to_path_buf()]
+    }
+}
+
+/// `custom/ai-dir-marker` (fork only): a checkout falls back to
+/// `<root>/.ai/.ai-memory.toml` and, in a linked worktree, to the main
+/// checkout's, at the checkout root's step of the walk.
+#[cfg(test)]
+mod ai_dir_tests {
+    use super::ai_dir_fixture::{
+        add_worktree, git, homes, main_checkout, main_with_worktree, same, write,
+    };
+    use super::*;
+    use tempfile::TempDir;
+
+    const MAIN_MARKER: &str = "workspace = \"glintt\"\nproject = \"scheduler\"\n\n\
+                               [capture]\nignore_paths = [\"NuGet.Config\"]\n";
+
+    fn memo_marker(cwd: &Path, home: &Path) -> Option<PathBuf> {
+        MarkerMemo::with_home(Some(home))
+            .find_marker(cwd, &mut || Some(()))
+            .expect("an unlimited budget always answers")
+    }
+
+    /// Adversarial (Glintt layout): `<main>/.ai/.ai-memory.toml` governs the
+    /// worktree below it as a `.ai` marker, anchored at the worktree root —
+    /// never as an ordinary ancestor marker anchored at `<main>/.ai` —
+    /// whether the walk stops at the worktree root (home outside) or goes on
+    /// through `<main>/.ai` (home above). The main checkout itself is
+    /// governed by it too, anchored at the main root. Every lookup agrees:
+    /// the plain walk, the settings walk, the memoized walk and the scope.
+    #[test]
+    fn the_main_checkouts_ai_dir_marker_governs_a_worktree_below_it() {
+        let tmp = TempDir::new().unwrap();
+        let Some((main, worktree)) = main_with_worktree(tmp.path()) else {
+            return;
+        };
+        let marker = write(&main.join(AI_DIR).join(MARKER_FILENAME), MAIN_MARKER);
+        let worktree_src = worktree.join("src");
+        let main_src = main.join("src");
+        std::fs::create_dir_all(&worktree_src).unwrap();
+        std::fs::create_dir_all(&main_src).unwrap();
+
+        for home in homes(tmp.path()) {
+            for (cwd, root) in [
+                (&worktree_src, &worktree),
+                (&worktree, &worktree),
+                (&main_src, &main),
+                (&main, &main),
+            ] {
+                let at = cwd.to_str().unwrap();
+                let found = find_marker_with_home(at, Some(&home))
+                    .unwrap_or_else(|| panic!("no marker from {at} (home {home:?})"));
+                assert!(same(&found, &marker), "{at}: found {found:?}");
+                assert!(is_ai_dir_marker(&found), "{found:?}");
+                let anchor = capture_anchor(&found, cwd).unwrap();
+                assert!(same(&anchor, root), "{at}: anchored at {anchor:?}");
+                assert!(!same(&anchor, &main.join(AI_DIR)), "{at}");
+                let settings = find_settings_marker_with_home(at, Some(&home)).unwrap();
+                assert!(same(&settings, &marker), "{at}: settings {settings:?}");
+                let memo = memo_marker(cwd, &home).unwrap();
+                assert!(same(&memo, &marker), "{at}: memo {memo:?}");
+                let selection = routing_selection_with_home(at, at, Some(&home), false)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selection.fields.workspace.as_deref(), Some("glintt"));
+                assert_eq!(selection.fields.project.as_deref(), Some("scheduler"));
+            }
+        }
+    }
+
+    /// Adversarial: with no marker in the worktree, at the main root or in
+    /// the main `.ai`, nothing governs the worktree — so allowlist mode
+    /// captures nothing there. Control: a sibling checkout's `.ai` marker
+    /// governs that checkout only. A root marker of the main checkout is not
+    /// inherited by an out-of-tree worktree (only `.ai` markers are shared).
+    #[test]
+    fn a_worktree_with_no_marker_anywhere_is_governed_by_none() {
+        let tmp = TempDir::new().unwrap();
+        let Some((main, worktree)) = main_with_worktree(tmp.path()) else {
+            return;
+        };
+        let worktree_src = worktree.join("src");
+        std::fs::create_dir_all(&worktree_src).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        git(&other, &["init", "-q"]);
+        let other_marker = write(&other.join(AI_DIR).join(MARKER_FILENAME), MAIN_MARKER);
+        let outside_tree = add_worktree(&main, &tmp.path().join("wt-out"), "feat/out");
+
+        for home in homes(tmp.path()) {
+            for cwd in [&worktree_src, &worktree, &outside_tree] {
+                let at = cwd.to_str().unwrap();
+                assert_eq!(find_marker_with_home(at, Some(&home)), None, "{at}");
+                assert_eq!(find_settings_marker_with_home(at, Some(&home)), None);
+                assert_eq!(memo_marker(cwd, &home), None, "{at}");
+            }
+            let found = find_marker_with_home(other.to_str().unwrap(), Some(&home)).unwrap();
+            assert!(same(&found, &other_marker), "{found:?}");
+        }
+
+        write(&main.join(MARKER_FILENAME), "project = \"main\"\n");
+        for home in homes(tmp.path()) {
+            let at = outside_tree.to_str().unwrap();
+            assert_eq!(find_marker_with_home(at, Some(&home)), None, "{at}");
+        }
+    }
+
+    /// Adversarial: a root marker wins over the `.ai` markers — the main
+    /// checkout's root marker over its `.ai`, and a worktree's own root
+    /// marker over the main `.ai`; a worktree's own `.ai` marker wins over
+    /// the main checkout's.
+    #[test]
+    fn a_root_marker_wins_over_ai_dir_markers() {
+        let tmp = TempDir::new().unwrap();
+        let Some((main, worktree)) = main_with_worktree(tmp.path()) else {
+            return;
+        };
+        let main_ai = write(&main.join(AI_DIR).join(MARKER_FILENAME), MAIN_MARKER);
+        let main_root = write(&main.join(MARKER_FILENAME), "project = \"main-root\"\n");
+        let worktree_src = worktree.join("src");
+        std::fs::create_dir_all(&worktree_src).unwrap();
+
+        for home in homes(tmp.path()) {
+            let at = main.to_str().unwrap();
+            let found = find_marker_with_home(at, Some(&home)).unwrap();
+            assert!(same(&found, &main_root), "{found:?}");
+            let selection = routing_selection_with_home(at, at, Some(&home), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selection.fields.project.as_deref(), Some("main-root"));
+        }
+
+        std::fs::remove_file(&main_root).unwrap();
+        let worktree_root = write(&worktree.join(MARKER_FILENAME), "project = \"wt-root\"\n");
+        for home in homes(tmp.path()) {
+            let at = worktree_src.to_str().unwrap();
+            let found = find_marker_with_home(at, Some(&home)).unwrap();
+            assert!(same(&found, &worktree_root), "{found:?}");
+            assert!(same(
+                &memo_marker(&worktree_src, &home).unwrap(),
+                &worktree_root
+            ));
+        }
+
+        std::fs::remove_file(&worktree_root).unwrap();
+        let worktree_ai = write(&worktree.join(AI_DIR).join(MARKER_FILENAME), MAIN_MARKER);
+        for home in homes(tmp.path()) {
+            let at = worktree_src.to_str().unwrap();
+            let found = find_marker_with_home(at, Some(&home)).unwrap();
+            assert!(same(&found, &worktree_ai), "{found:?}");
+            assert!(!same(&found, &main_ai));
+        }
+    }
+
+    /// Adversarial: only the `.ai` directory at a checkout root holds a `.ai`
+    /// marker. One deeper in the tree, or outside any checkout, is an
+    /// ordinary marker anchored at its own directory, and the root walk
+    /// never reaches it from a sibling directory.
+    #[test]
+    fn an_ai_dir_away_from_a_checkout_root_is_an_ordinary_marker() {
+        let tmp = TempDir::new().unwrap();
+        let Some(main) = main_checkout(tmp.path()) else {
+            return;
+        };
+        let nested = write(
+            &main.join("sub").join(AI_DIR).join(MARKER_FILENAME),
+            MAIN_MARKER,
+        );
+        assert!(!is_ai_dir_marker(&nested));
+        let inner = main.join("sub").join(AI_DIR).join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert!(same(
+            &capture_anchor(&nested, &inner).unwrap(),
+            &main.join("sub").join(AI_DIR)
+        ));
+        let sibling = main.join("sub").join("other");
+        std::fs::create_dir_all(&sibling).unwrap();
+        for home in homes(tmp.path()) {
+            assert_eq!(
+                find_marker_with_home(sibling.to_str().unwrap(), Some(&home)),
+                None
+            );
+        }
+
+        let plain = write(
+            &tmp.path().join("plain").join(AI_DIR).join(MARKER_FILENAME),
+            MAIN_MARKER,
+        );
+        assert!(!is_ai_dir_marker(&plain));
     }
 }

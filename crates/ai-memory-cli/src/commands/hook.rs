@@ -34,8 +34,8 @@ use crate::server_profiles::{self, ProfileName, Route as HookRoute};
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
-    hook_scope, inbox_notice_query_suffix, marker_capture_policy, marker_query_suffix,
+    HookScope, anchored_capture_policy, build_client, canonical_context, capture_policy,
+    extract_cwd, get_handoff, hook_scope, inbox_notice_query_suffix, marker_query_suffix,
     marker_query_suffix_for_subagent_brief, marker_query_suffix_without_briefing,
     marker_requests_briefing, marker_requests_inbox_notice, marker_requests_subagent_briefing,
     resolve_cwd_with_fallbacks, url_encode,
@@ -3053,7 +3053,16 @@ fn foreign_decision_within(
     else {
         return unprovable();
     };
-    let mut markers: Vec<PathBuf> = Vec::new();
+    // Each governing marker with the directory its `ignore_paths` are
+    // anchored at: a `.ai` marker governs the main checkout and every linked
+    // worktree, each anchored at its own root.
+    let mut markers: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let own = own_marker.map(|marker| {
+        (
+            marker.to_path_buf(),
+            crate::marker::capture_anchor(marker, Path::new(inspection_cwd)),
+        )
+    });
     let mut memo = crate::marker::MarkerMemo::with_home(home);
     // The event's own lookups already paid for these, outside the budget; a
     // location below the cwd then stops at it.
@@ -3111,7 +3120,10 @@ fn foreign_decision_within(
                         None => break,
                     }
                 };
-                marker
+                marker.map(|marker| {
+                    let anchor = crate::marker::capture_anchor(&marker, &dir);
+                    (marker, anchor)
+                })
             }
             None => None,
         };
@@ -3126,20 +3138,30 @@ fn foreign_decision_within(
             }
             None => Vec::new(),
         };
-        for marker in marker.into_iter().chain(below) {
-            if Some(marker.as_path()) == own_marker || markers.contains(&marker) {
+        let below = below.into_iter().map(|marker| {
+            let anchor = marker
+                .parent()
+                .and_then(|dir| crate::marker::capture_anchor(&marker, dir));
+            (marker, anchor)
+        });
+        for governing in marker.into_iter().chain(below) {
+            if own.as_ref() == Some(&governing) || markers.contains(&governing) {
                 continue;
             }
             if markers.len() == MAX_FOREIGN_MARKERS {
                 return unprovable();
             }
-            markers.push(marker);
+            markers.push(governing);
         }
     }
     markers
         .iter()
-        .map(|marker| {
-            marker_capture_policy(marker, inspection_cwd).inspect(agent, raw, inspection_cwd)
+        .map(|(marker, anchor)| {
+            anchored_capture_policy(marker, anchor.as_deref(), inspection_cwd).inspect(
+                agent,
+                raw,
+                inspection_cwd,
+            )
         })
         .reduce(CaptureDecision::stricter)
 }
@@ -3747,6 +3769,117 @@ mod tests {
         )
         .unwrap();
         assert!(admits_capture_at(data_dir.path(), checkout.path()));
+    }
+
+    /// Adversarial (`custom/ai-dir-marker`, Glintt layout): under allowlist
+    /// mode a worktree at `<main>/.ai/.local/worktrees/T-1` with no marker is
+    /// refused, and is admitted once the main checkout's
+    /// `.ai/.ai-memory.toml` opts it in.
+    #[test]
+    fn the_allowlist_admits_a_worktree_through_the_main_ai_dir_marker() {
+        use crate::marker::ai_dir_fixture::{main_with_worktree, write};
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(data_dir.path().join(CAPTURE_MODE_FILE), "allowlist\n").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((main, worktree)) = main_with_worktree(tmp.path()) else {
+            return;
+        };
+        let worktree_src = worktree.join("src");
+        std::fs::create_dir_all(&worktree_src).unwrap();
+        for cwd in [&worktree, &worktree_src, &main] {
+            assert!(!admits_capture_at(data_dir.path(), cwd), "{cwd:?}");
+            assert!(!checkout_admits_capture(
+                data_dir.path(),
+                cwd.to_str().unwrap()
+            ));
+        }
+        write(
+            &main.join(".ai").join(".ai-memory.toml"),
+            "workspace = \"glintt\"\nproject = \"scheduler\"\n",
+        );
+        for cwd in [&worktree, &worktree_src, &main] {
+            assert!(admits_capture_at(data_dir.path(), cwd), "{cwd:?}");
+            assert!(checkout_admits_capture(
+                data_dir.path(),
+                cwd.to_str().unwrap()
+            ));
+        }
+    }
+
+    /// Adversarial (`custom/ai-dir-marker`, Glintt layout): the main
+    /// checkout's `.ai` marker with `ignore_paths = ["NuGet.Config"]` drops
+    /// the worktree's own `NuGet.Config` — its patterns are anchored at the
+    /// worktree root, never at `<main>/.ai` — whether `$HOME` lies outside
+    /// the tree or above it. From the worktree, the main checkout's
+    /// `NuGet.Config` is dropped by the same marker anchored at the main
+    /// root; `<main>/.ai/NuGet.Config` and other files are kept.
+    #[test]
+    fn the_main_ai_dir_marker_drops_the_worktrees_nuget_config() {
+        use crate::marker::ai_dir_fixture::{homes, main_with_worktree, write};
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((main, worktree)) = main_with_worktree(tmp.path()) else {
+            return;
+        };
+        write(
+            &main.join(".ai").join(".ai-memory.toml"),
+            "workspace = \"glintt\"\nproject = \"scheduler\"\n\n\
+             [capture]\nignore_paths = [\"NuGet.Config\"]\n",
+        );
+        for file in [
+            worktree.join("NuGet.Config"),
+            worktree.join("src").join("Job.cs"),
+            main.join("NuGet.Config"),
+            main.join(".ai").join("NuGet.Config"),
+        ] {
+            write(&file, "<configuration/>\n");
+        }
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        let cwd = lexical_capture_cwd(&worktree.to_string_lossy());
+
+        for home in homes(tmp.path()) {
+            let own = crate::marker::find_marker_with_home(&cwd, Some(&home)).unwrap();
+            let anchor = crate::marker::capture_anchor(&own, Path::new(&cwd));
+            let policy = anchored_capture_policy(&own, anchor.as_deref(), &cwd);
+            let own_disposition = |command: &str| {
+                policy
+                    .inspect(AgentKind::ClaudeCode, &bash_call(&worktree, command), &cwd)
+                    .protocol()
+                    .disposition()
+            };
+            assert_eq!(
+                own_disposition("cat NuGet.Config"),
+                CaptureDisposition::Drop,
+                "home {home:?}"
+            );
+            assert_eq!(own_disposition("cat src/Job.cs"), CaptureDisposition::Keep);
+            assert_eq!(
+                own_disposition("cat ../../../NuGet.Config"),
+                CaptureDisposition::Keep,
+                "never anchored at <main>/.ai (home {home:?})"
+            );
+            assert_eq!(
+                foreign_disposition(
+                    &worktree,
+                    "cat ../../../../NuGet.Config",
+                    Some(&own),
+                    Some(&home),
+                    fast
+                ),
+                Some(CaptureDisposition::Drop),
+                "the main checkout's own NuGet.Config (home {home:?})"
+            );
+            assert_ne!(
+                foreign_disposition(
+                    &worktree,
+                    "cat ../../../NuGet.Config",
+                    Some(&own),
+                    Some(&home),
+                    fast
+                ),
+                Some(CaptureDisposition::Drop),
+                "<main>/.ai/NuGet.Config (home {home:?})"
+            );
+        }
     }
 
     /// "The server is down": a loopback endpoint that accepts and immediately
