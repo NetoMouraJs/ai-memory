@@ -11,18 +11,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-### Added
-
-- Orchestrator workers: the native hook reads `AI_MEMORY_HOOK_INJECT`
-  (`all`, `no-handoff`, `none`), `AI_MEMORY_SESSION_ROLE` (`automation`,
-  `builder`, `reviewer`, `qa`) and `AI_MEMORY_SESSION_LABEL`. A worker can
-  start without the operator's handoff, inbox notice or close of an
-  interrupted session, or with no injected context at all, while capture stays
-  the same; its role is stored as the session origin and its label as the
-  display name. `GET /handoff` accepts `inbox=0`, the server logs each worker's
-  start, and `ai-memory capabilities --json` lists what the binary supports
-  (fork customization).
-
 ## [3.5.0] - 2026-11-18
 
 ### Added
