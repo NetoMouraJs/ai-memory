@@ -491,9 +491,25 @@ async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
         .await
         .unwrap();
 
-    for (session, body) in [
-        (created_by_capture, "created by the automation capture"),
-        (pre_existing, "stamped onto the existing row"),
+    // Session C: an orchestrator worker that declared a role instead of the
+    // bare automation origin. Every role is automation to the harvester.
+    let reviewer = SessionId::new();
+    for (session, origin, body) in [
+        (
+            created_by_capture,
+            ai_memory_core::SessionOrigin::Automation,
+            "created by the automation capture",
+        ),
+        (
+            pre_existing,
+            ai_memory_core::SessionOrigin::Automation,
+            "stamped onto the existing row",
+        ),
+        (
+            reviewer,
+            ai_memory_core::SessionOrigin::Reviewer,
+            "written by a reviewer worker",
+        ),
     ] {
         let new_session = NewSession {
             occurred_at: None,
@@ -503,7 +519,7 @@ async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/app".into()),
             actor_user: None,
-            origin: Some(ai_memory_core::SessionOrigin::Automation),
+            origin: Some(origin),
         };
         let obs = NewObservation {
             occurred_at: None,
@@ -538,7 +554,7 @@ async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
         .profile_harvest_inputs(ws, app, mark, 50, false)
         .await
         .unwrap();
-    assert_eq!(all.len(), 3, "all three prompts present without the filter");
+    assert_eq!(all.len(), 4, "all four prompts present without the filter");
     // With the policy on, both automation sessions are filtered (the one the
     // capture created and the one whose row already existed), and only the
     // interactive session's prompt remains.
@@ -551,7 +567,7 @@ async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
     assert_eq!(bodies, vec!["use pnpm here"], "only the interactive prompt");
     assert!(
         kept.iter().all(|p| p.session_id == interactive),
-        "both automation sessions must be filtered out"
+        "the automation sessions and the reviewer worker must be filtered out"
     );
 }
 

@@ -160,6 +160,10 @@ pub enum Command {
     Setup(SetupArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// List the optional launcher features this binary supports (hook
+    /// injection levels, session role and label), so an orchestrator can
+    /// detect them when the version number alone does not tell.
+    Capabilities(CapabilitiesArgs),
     /// List every workspace/project pair the server knows about (plain,
     /// scriptable output — the read-only equivalent of hitting
     /// `GET /api/v1/projects` directly, falling back to `GET /admin/projects`
@@ -2203,6 +2207,14 @@ pub struct SetupArgs {
 /// Arguments for `status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `capabilities`.
+#[derive(Debug, Args)]
+pub struct CapabilitiesArgs {
     /// Emit the report as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,

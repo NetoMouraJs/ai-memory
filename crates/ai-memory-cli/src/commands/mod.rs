@@ -40,6 +40,7 @@ pub mod backup;
 pub mod backup_agents;
 pub mod bootstrap;
 pub mod call;
+pub mod capabilities;
 pub mod checkpoints;
 pub mod codex_hook_trust;
 pub mod commit;

@@ -200,14 +200,30 @@ pub enum SessionOrigin {
     /// generated brief is not mistaken for the operator's own preferences
     /// (#2180). Capture, handoff and recall are unaffected.
     Automation,
+    /// An orchestrator worker in the builder role, declared with
+    /// `AI_MEMORY_SESSION_ROLE=builder`. Every role is automation for the
+    /// profile harvester.
+    Builder,
+    /// An orchestrator worker in the reviewer role
+    /// (`AI_MEMORY_SESSION_ROLE=reviewer`).
+    Reviewer,
+    /// An orchestrator worker in the QA role (`AI_MEMORY_SESSION_ROLE=qa`).
+    Qa,
 }
 
 impl SessionOrigin {
+    /// Every origin, in wire order. `ai-memory capabilities` advertises the
+    /// role tokens from this list.
+    pub const ALL: [Self; 4] = [Self::Automation, Self::Builder, Self::Reviewer, Self::Qa];
+
     /// The stored token for this origin.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Automation => "automation",
+            Self::Builder => "builder",
+            Self::Reviewer => "reviewer",
+            Self::Qa => "qa",
         }
     }
 
@@ -217,10 +233,10 @@ impl SessionOrigin {
     /// than stored verbatim.
     #[must_use]
     pub fn parse_wire(value: &str) -> Option<Self> {
-        match value.trim() {
-            "automation" => Some(Self::Automation),
-            _ => None,
-        }
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|origin| origin.as_str() == value)
     }
 }
 
@@ -330,10 +346,24 @@ mod tests {
         );
         // Anything outside the closed set is ignored, so an unknown origin is
         // treated as an ordinary session rather than stored verbatim (#2180).
-        for unknown in ["", "Automation", "auto", "interactive", "batch", "1"] {
+        for unknown in [
+            "",
+            "Automation",
+            "auto",
+            "interactive",
+            "batch",
+            "1",
+            "Reviewer",
+            "QA",
+            "planner",
+        ] {
             assert_eq!(SessionOrigin::parse_wire(unknown), None, "{unknown:?}");
         }
         assert_eq!(SessionOrigin::Automation.as_str(), "automation");
+        for origin in SessionOrigin::ALL {
+            assert_eq!(SessionOrigin::parse_wire(origin.as_str()), Some(origin));
+        }
+        assert_eq!(SessionOrigin::parse_wire(" qa"), Some(SessionOrigin::Qa));
     }
 }
 

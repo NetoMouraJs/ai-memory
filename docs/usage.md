@@ -132,6 +132,18 @@ AI_MEMORY_AUTO_HANDOFF=off claude -p "Review the parser change"
 
 The hook forwards it as `auto_handoff=0` on that session's events, so its end (or OpenCode/Antigravity turn checkpoint) writes the summary page and queues consolidation without leaving a baton. Other sessions, including ones running at the same time in the same project, keep the server's `create_on_session_end` behavior. `off`, `0`, `false` and `no` turn it off; any other value, or leaving it unset, changes nothing. It can only remove this session's automatic baton, never create one the server would not. The native `ai-memory hook`, the shell and PowerShell hook bundles and the generated TypeScript plugins all read it (#1951).
 
+### Orchestrator workers
+
+An orchestrator that launches agents as workers can set three more variables in the worker's environment. Only the native `ai-memory hook` reads them; the shell and PowerShell bundles and the generated TypeScript plugins ignore them.
+
+| Variable | Values | Effect |
+|---|---|---|
+| `AI_MEMORY_HOOK_INJECT` | `all` (default), `no-handoff`, `none` | `no-handoff` keeps recovery, anchors, recaps, briefs and the profile digest, but asks the server to leave the pending handoff and the inbox notice out (`handoff=0&inbox=0`), skips the per-prompt inbox notice, and never closes the interrupted session a recovery snapshot names. `none` sends no context request at all. Capture never changes. An unrecognised value counts as `none`, so a typo cannot hand a reviewer the operator's handoff. |
+| `AI_MEMORY_SESSION_ROLE` | `automation`, `builder`, `reviewer`, `qa` | Stored as the session origin, in place of `AI_MEMORY_SESSION_ORIGIN`. Every role counts as automation for `[profile] harvest_prompts = "interactive"`. An unknown role is ignored. |
+| `AI_MEMORY_SESSION_LABEL` | free text | Sent as the session's display name, replacing the name the harness gives it. Scrubbed and clipped to 256 bytes. |
+
+The server logs each worker's start with the level, role and label it received, so an orchestrator can confirm the variables reached a harness whose hook output is hidden. `ai-memory capabilities --json` lists the accepted values, so a launcher can tell whether the installed binary supports them. Pair `none` or `no-handoff` with `AI_MEMORY_AUTO_HANDOFF=off` so a worker also leaves no baton for the operator's next session.
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the

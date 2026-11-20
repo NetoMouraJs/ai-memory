@@ -422,9 +422,11 @@ pub(crate) fn profile_prompts_since(
     // `[profile] harvest_prompts = "interactive"` drops prompts from sessions a
     // launcher stamped as automation (#2180), so a generated orchestrator brief
     // is not harvested as the operator's own preference. A row with no session
-    // (NULL-joined) or a NULL origin is an ordinary session and stays in.
+    // (NULL-joined) or a NULL origin is an ordinary session and stays in. Every
+    // stored origin, the worker roles included, is a launcher's declaration of
+    // automation, so any non-NULL origin is skipped.
     let origin_filter = if skip_automation {
-        "AND (s.origin IS NULL OR s.origin != ?6) "
+        "AND s.origin IS NULL "
     } else {
         ""
     };
@@ -446,16 +448,13 @@ pub(crate) fn profile_prompts_since(
          ORDER BY o.created_at ASC, o.id ASC"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![
+    let binds: Vec<Box<dyn rusqlite::ToSql>> = vec![
         Box::new(workspace_id.as_bytes().to_vec()),
         Box::new(project_id.as_bytes().to_vec()),
         Box::new(ai_memory_core::ObservationKind::UserPrompt.as_str()),
         Box::new(since),
         Box::new(limit),
     ];
-    if skip_automation {
-        binds.push(Box::new(ai_memory_core::SessionOrigin::Automation.as_str()));
-    }
     let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,

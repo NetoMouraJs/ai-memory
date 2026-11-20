@@ -2029,6 +2029,11 @@ pub struct HandoffQuery {
     /// ignores it; the clients also send `handoff=0&recovery=0&profile_digest=0`
     /// so that server still returns only the notice.
     pub inbox_only: Option<String>,
+    /// Sent falsy (`inbox=0`) by the session start of a worker launched with
+    /// `AI_MEMORY_HOOK_INJECT=no-handoff`: the count-only inbox notice is left
+    /// out of the on-start context, and everything else is delivered as the
+    /// other flags say. A server that predates the flag ignores it.
+    pub inbox: Option<String>,
     /// Truthy from a Claude Code `UserPromptSubmit` whose marker routes to a
     /// project other than the one the session started in (#2103). `GET /brief`
     /// then answers with that project's core brief only when
@@ -2421,10 +2426,16 @@ async fn fetch_and_accept_handoff_at(
     // text (no subject, no sender string) — so a hostile message cannot inject
     // text into the on-start context. Nothing is popped here; the agent pops
     // deliberately via memory_message_pop.
-    let inbox_notice = combine_handoff_and_brief(
-        pending_inbox_notice(state, ws, proj, agent).await,
-        lint_warnings_notice(state, ws, proj).await,
-    );
+    // `inbox=0` comes from a worker launched with
+    // `AI_MEMORY_HOOK_INJECT=no-handoff`: the mail belongs to the operator's
+    // own sessions, so the worker's start leaves the notice out.
+    let inbox_md = if crate::payload::query_flag_falsy(query.inbox.as_deref()) {
+        None
+    } else {
+        pending_inbox_notice(state, ws, proj, agent).await
+    };
+    let inbox_notice =
+        combine_handoff_and_brief(inbox_md, lint_warnings_notice(state, ws, proj).await);
     // A delivered baton supplies the recovery body. Keep another session's
     // uncovered work as a metadata-only pointer instead of mixing its live
     // transcript into the baton the receiver actually claimed.
@@ -5797,6 +5808,21 @@ async fn process_authorized(
         );
     }
 
+    // An orchestrated worker's start records what its hook process read, so
+    // the orchestrator can prove `AI_MEMORY_HOOK_INJECT` and the role reached
+    // a harness whose hook stderr is never shown (Codex).
+    if env.event == HookEvent::SessionStart
+        && (env.hook_inject.is_some() || env.session_origin.is_some())
+    {
+        info!(
+            session = %session_id,
+            inject = env.hook_inject.unwrap_or("all"),
+            origin = env.session_origin.map(ai_memory_core::SessionOrigin::as_str),
+            label = display_name.as_ref().map(|name| name.name.as_str()),
+            "orchestrated session start"
+        );
+    }
+
     // Append the log line to the per-project log.md.
     if let Err(e) = log::append_event(
         &state.wiki,
@@ -7118,6 +7144,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -7542,6 +7569,75 @@ pub(crate) mod tests {
         assert_eq!(
             state.active_project.get(),
             Some((state.workspace_id, state.project_id))
+        );
+    }
+
+    /// A worker launched with `AI_MEMORY_HOOK_INJECT=no-handoff` starts with
+    /// `handoff=0&inbox=0`: the operator's mail count stays out of its context
+    /// and the operator's baton stays open. The control, the same start
+    /// without `inbox=0`, shows the count, so the flag is what removes it.
+    #[tokio::test]
+    async fn a_worker_start_with_inbox_off_shows_no_mail_notice_and_claims_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_inbox(&state, 2).await;
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "OPERATOR-BATON".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let fetch = |inbox: Option<&'static str>| {
+            let state = state.clone();
+            let query = HandoffQuery {
+                handoff: Some("0".into()),
+                inbox: inbox.map(Into::into),
+                ..session_start_query(&cwd)
+            };
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        None,
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = fetch(Some("0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("cross-project message"), "{body}");
+        assert!(!body.contains("OPERATOR-BATON"), "{body}");
+        assert!(
+            open_handoff_exists(&state).await,
+            "a worker claimed the baton"
+        );
+
+        let (status, body) = fetch(None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("2 cross-project messages waiting"), "{body}");
+        assert!(
+            open_handoff_exists(&state).await,
+            "handoff=0 still claims nothing"
         );
     }
 
@@ -8337,6 +8433,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             aliases: None,
@@ -19234,6 +19331,7 @@ pub(crate) mod tests {
                 handoff: None,
                 recovery: None,
                 inbox_only: None,
+                inbox: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -19481,6 +19579,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -19719,6 +19818,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox: None,
             agent: Some(agent.into()),
             session_id: Some(session_id),
             ..Default::default()
@@ -19914,6 +20014,7 @@ pub(crate) mod tests {
             handoff: None,
             recovery: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -21509,6 +21610,7 @@ pub(crate) mod tests {
                     recovery: None,
                     claim: None,
                     inbox_only: None,
+                    inbox: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -22142,6 +22244,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -22238,6 +22341,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -22353,6 +22457,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -22555,6 +22660,7 @@ pub(crate) mod tests {
                     recovery: None,
                     claim: None,
                     inbox_only: None,
+                    inbox: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
@@ -23736,6 +23842,7 @@ pub(crate) mod tests {
                 recovery: None,
                 claim: None,
                 inbox_only: None,
+                inbox: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -23827,6 +23934,7 @@ pub(crate) mod tests {
                 recovery: None,
                 claim: None,
                 inbox_only: None,
+                inbox: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -23909,6 +24017,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -24072,6 +24181,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -24201,6 +24311,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -24292,6 +24403,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -24999,6 +25111,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -25172,6 +25285,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -26034,6 +26148,7 @@ pub(crate) mod tests {
                 recovery: None,
                 claim: None,
                 inbox_only: None,
+                inbox: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -30246,6 +30361,7 @@ pub(crate) mod tests {
                     handoff: None,
                     recovery: None,
                     inbox_only: None,
+                    inbox: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -30326,6 +30442,7 @@ pub(crate) mod tests {
             recovery: None,
             claim: None,
             inbox_only: None,
+            inbox: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),
             workspace: None,
