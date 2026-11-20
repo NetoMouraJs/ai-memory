@@ -70,6 +70,17 @@ const SESSION_ORIGIN_ENV: &str = "AI_MEMORY_SESSION_ORIGIN";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
+/// How much context the hook injects into this execution: `all` (default),
+/// `no-handoff` or `none`. An orchestrator sets it on its workers; capture is
+/// never affected.
+const HOOK_INJECT_ENV: &str = "AI_MEMORY_HOOK_INJECT";
+/// The worker role an orchestrator declares (`builder`, `reviewer`, `qa`, or
+/// `automation`). Stored as the session origin and preferred over
+/// [`SESSION_ORIGIN_ENV`]; an unknown value is ignored.
+const SESSION_ROLE_ENV: &str = "AI_MEMORY_SESSION_ROLE";
+/// A free-form label an orchestrator gives the session (for example its job
+/// name). Sent as the session's display name in place of the harness's own.
+const SESSION_LABEL_ENV: &str = "AI_MEMORY_SESSION_LABEL";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -858,16 +869,104 @@ fn managed_run_query_suffix() -> String {
 /// `AI_MEMORY_SESSION_ORIGIN` (#2180). Validated against the closed set here so
 /// an unknown value never reaches the wire; absent sends nothing, matching an
 /// ordinary interactive session.
+///
+/// A recognised `AI_MEMORY_SESSION_ROLE` wins over the origin variable, since
+/// every role is itself an automation origin.
 fn session_origin_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
-    env_lookup(SESSION_ORIGIN_ENV)
+    env_lookup(SESSION_ROLE_ENV)
         .and_then(|value| ai_memory_core::SessionOrigin::parse_wire(&value))
+        .or_else(|| {
+            env_lookup(SESSION_ORIGIN_ENV)
+                .and_then(|value| ai_memory_core::SessionOrigin::parse_wire(&value))
+        })
         .map_or_else(String::new, |origin| {
             format!("&session_origin={}", url_encode(origin.as_str()))
         })
 }
 
-fn session_origin_query_suffix() -> String {
-    session_origin_query_suffix_with(env_lookup)
+/// How much context the hook injects, from `AI_MEMORY_HOOK_INJECT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InjectLevel {
+    /// Everything the hook injects today. The default for human sessions.
+    All,
+    /// Recovery, anchors, recaps, briefs and the profile digest, but never the
+    /// pending handoff, the inbox notice, or a close of the interrupted
+    /// session the recovery describes.
+    NoHandoff,
+    /// No context request at all.
+    Nothing,
+}
+
+impl InjectLevel {
+    /// The accepted tokens, advertised by `ai-memory capabilities`.
+    pub(crate) const TOKENS: [&'static str; 3] = ["all", "no-handoff", "none"];
+
+    /// Unset or empty means `all`. Any other unrecognised value means `none`:
+    /// only an orchestrator sets the variable, and a typo there must not hand
+    /// a reviewer the operator's handoff.
+    fn from_env_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        let Some(value) = env_lookup(HOOK_INJECT_ENV) else {
+            return Self::All;
+        };
+        match value.trim() {
+            "" | "all" => Self::All,
+            "no-handoff" => Self::NoHandoff,
+            _ => Self::Nothing,
+        }
+    }
+
+    /// `&inject=<level>` on the captured event, so the server log shows what
+    /// the hook process read. `all` sends nothing.
+    fn event_query_suffix(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::NoHandoff => "&inject=no-handoff",
+            Self::Nothing => "&inject=none",
+        }
+    }
+
+    fn injects(self) -> bool {
+        self != Self::Nothing
+    }
+
+    fn delivers_handoff(self) -> bool {
+        self == Self::All
+    }
+}
+
+/// Add `key=0` for each key the `/handoff` URL does not already carry. The
+/// server rejects a repeated key with 400, and a marker that opted out of
+/// handoff delivery already sends `&handoff=0`.
+fn with_falsy_flags(mut url: String, keys: &[&str]) -> String {
+    for key in keys {
+        let present = url
+            .split(['?', '&'])
+            .any(|pair| pair.split_once('=').map_or(pair, |(name, _)| name) == *key);
+        if !present {
+            url.push('&');
+            url.push_str(key);
+            url.push_str("=0");
+        }
+    }
+    url
+}
+
+/// The display-name marker that carries `AI_MEMORY_SESSION_LABEL`, scrubbed
+/// like the Codex index name before it reaches the spool. Revised at every
+/// event, so it stays ahead of any name the harness set.
+fn session_label_marker_with(
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+    privacy: &ai_memory_core::SanitizeConfig,
+    now: jiff::Timestamp,
+) -> Option<serde_json::Value> {
+    let label = env_lookup(SESSION_LABEL_ENV)?;
+    let label = ai_memory_core::Sanitizer::new(privacy).ok()?.scrub(&label);
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let label = ai_memory_core::truncate_utf8_bytes(label, 256);
+    Some(serde_json::json!({ "name": label, "updated_at": now.to_string() }))
 }
 
 /// `&auto_handoff=0` when `AI_MEMORY_AUTO_HANDOFF` turns the automatic
@@ -2098,6 +2197,20 @@ where
         json[ai_memory_hooks::session_name::MARKER] = name;
         payload = serde_json::to_string(&json)?;
     }
+    // An orchestrator's label replaces whatever name the harness supplied.
+    let runtime_var = |name: &str| {
+        runtime_env
+            .var_os(name)
+            .and_then(|value| value.into_string().ok())
+    };
+    let inject = InjectLevel::from_env_with(runtime_var);
+    if let Some(label) =
+        session_label_marker_with(runtime_var, &spool_policy.sanitize, jiff::Timestamp::now())
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert(ai_memory_hooks::session_name::MARKER.into(), label);
+        payload = serde_json::to_string(&json)?;
+    }
     let mut live_batch = None;
     // Claude Code runs hooks inside subagents too, tagging their events with
     // `agent_id` while `transcript_path` still names the main session's
@@ -2177,9 +2290,11 @@ where
     let mut incremental_background_drain = false;
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json, session_id_pin);
     let managed_qs = managed_run_query_suffix();
-    let session_origin_qs = session_origin_query_suffix();
+    let session_origin_qs = session_origin_query_suffix_with(runtime_var);
     let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
-    let hook_qs = format!("{qs}{session_qs}{managed_qs}{session_origin_qs}{auto_handoff_qs}");
+    let inject_qs = inject.event_query_suffix();
+    let hook_qs =
+        format!("{qs}{session_qs}{managed_qs}{session_origin_qs}{auto_handoff_qs}{inject_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -2368,7 +2483,8 @@ where
         // anchor instead; every other one, and an unavailable anchor, gets
         // the normal empty reply.
         if is_compaction_session_start(&json) {
-            if injects_compaction_anchor(agent_kind, &json)
+            if inject.injects()
+                && injects_compaction_anchor(agent_kind, &json)
                 && let Some(session_id) = canonical_session_id.as_deref()
             {
                 let client = build_client();
@@ -2384,6 +2500,9 @@ where
                     return Ok(());
                 }
             }
+        } else if !inject.injects() {
+            // `AI_MEMORY_HOOK_INJECT=none`: no context request, so nothing is
+            // read, claimed or closed; the normal empty reply follows.
         } else if agent_kind.session_start_injects_handoff() && !handoff_scoped {
             eprintln!(
                 "{}",
@@ -2415,15 +2534,22 @@ where
                 || session_qs.clone(),
                 |session_id| format!("&session_id={}", url_encode(session_id)),
             );
-            let handoff_url = format!(
+            let mut handoff_url = format!(
                 "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                 args.agent
             );
+            if !inject.delivers_handoff() {
+                handoff_url = with_falsy_flags(handoff_url, &["handoff", "inbox"]);
+            }
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
                 let (backfill_candidate, handoff) = extract_backfill_marker(&handoff);
-                if let Some(candidate) = &backfill_candidate {
+                // A worker reads the recovery snapshot but never closes the
+                // operator's interrupted session it describes.
+                if inject.delivers_handoff()
+                    && let Some(candidate) = &backfill_candidate
+                {
                     dispatch_backfill_close(
                         candidate,
                         &dd,
@@ -2454,7 +2580,8 @@ where
     // gets the `{}` it always got. Cursor also runs these hook settings, and
     // its handling of this envelope is unverified, so a Cursor payload gets
     // nothing.
-    if hook_event == HookEvent::SubagentStart
+    if inject.injects()
+        && hook_event == HookEvent::SubagentStart
         && agent_kind.subagent_start_injects_context()
         && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
         && let Some(cwd) = policy_cwd.as_deref()
@@ -2483,7 +2610,8 @@ where
     // Cursor runs Claude Code's settings too; its handling of this envelope
     // is unverified, so a Cursor payload gets nothing. Drain first so the
     // latest pre-compact boundary is stored before the recap reads it.
-    if reload_requested
+    if inject.injects()
+        && reload_requested
         && agent_kind.user_prompt_injects_context()
         && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
         && let Some(session_id) = canonical_session_id.as_deref()
@@ -2510,7 +2638,11 @@ where
     }
     // Grok discards an allowing UserPromptSubmit's output, so the request
     // waits for the session's next tool result (below).
-    if reload_requested && agent_kind.post_tool_injects_handoff() && !subagent_payload {
+    if inject.injects()
+        && reload_requested
+        && agent_kind.post_tool_injects_handoff()
+        && !subagent_payload
+    {
         mark_recap_pending(&recap_pending_path(
             &dd,
             &args.agent,
@@ -2536,7 +2668,8 @@ where
     // The installed kimi hook passes the script stem (`user-prompt-submit`)
     // while the legacy shell path posts `user-prompt`; HookEvent::parse
     // canonicalizes both (and the snake/native spellings) to UserPrompt.
-    if HookEvent::parse(&args.event) == HookEvent::UserPrompt
+    if inject.injects()
+        && HookEvent::parse(&args.event) == HookEvent::UserPrompt
         && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
         && handoff_scoped
     {
@@ -2592,10 +2725,13 @@ where
         } else {
             qs.clone()
         };
-        let handoff_url = format!(
+        let mut handoff_url = format!(
             "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
+        if !inject.delivers_handoff() {
+            handoff_url = with_falsy_flags(handoff_url, &["handoff", "inbox"]);
+        }
         let handoff =
             get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
         // Mark the session as briefed only AFTER the GET completed — success
@@ -2626,7 +2762,8 @@ where
     // a marker-declared project (`project_src=marker`). The envelope is the one
     // the inbox notice below uses. Cursor runs these hook settings too, so a
     // Cursor payload gets nothing.
-    if hook_event == HookEvent::UserPrompt
+    if inject.injects()
+        && hook_event == HookEvent::UserPrompt
         && agent_kind == AgentKind::ClaudeCode
         && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
         && let Some(cwd) = policy_cwd.as_deref()
@@ -2670,7 +2807,8 @@ where
     // message text. Cursor runs these hook settings too; its handling of the
     // envelope is unverified, so a Cursor payload gets nothing (same guard
     // as the recap above).
-    if hook_event == HookEvent::UserPrompt
+    if inject.delivers_handoff()
+        && hook_event == HookEvent::UserPrompt
         && agent_kind == AgentKind::ClaudeCode
         && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
         && let Some(cwd) = policy_cwd.as_deref()
@@ -2720,7 +2858,7 @@ where
     // another harness was active. Only a genuinely new session asks for the
     // startup briefing/profile digest; later or resumed prompts request an
     // already-open handoff only.
-    if hermes_user_prompt && handoff_scoped {
+    if inject.injects() && hermes_user_prompt && handoff_scoped {
         let client = build_client();
         let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
         let native_session_qs = canonical_session_id
@@ -2746,10 +2884,13 @@ where
         } else {
             "&profile_digest=0"
         };
-        let handoff_url = format!(
+        let mut handoff_url = format!(
             "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
+        if !inject.delivers_handoff() {
+            handoff_url = with_falsy_flags(handoff_url, &["handoff", "inbox"]);
+        }
         if let Some(handoff) =
             get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
         {
@@ -2765,7 +2906,8 @@ where
     // leaves the handoff open for memory_handoff_accept.
     // The same event carries a "reload context" recap the session's prompt
     // asked for, once, after any handoff.
-    if HookEvent::parse(&args.event) == HookEvent::PostToolUse
+    if inject.injects()
+        && HookEvent::parse(&args.event) == HookEvent::PostToolUse
         && AgentKind::from_wire(&args.agent).post_tool_injects_handoff()
         && !subagent_payload
     {
@@ -2781,7 +2923,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        let wants_handoff = handoff_scoped && !shown.is_file();
+        let wants_handoff = inject.delivers_handoff() && handoff_scoped && !shown.is_file();
         let wants_recap = canonical_session_id.is_some() && recap_pending_is_fresh(&recap_pending);
         if wants_handoff || wants_recap {
             let client = build_client();
@@ -3563,6 +3705,120 @@ mod tests {
         for keep in [None, Some(""), Some("on"), Some("1"), Some("maybe")] {
             assert_eq!(auto_handoff_query_suffix_with(lookup(keep)), "", "{keep:?}");
         }
+    }
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn the_inject_level_defaults_to_all_and_fails_closed() {
+        assert_eq!(InjectLevel::from_env_with(env_of(&[])), InjectLevel::All);
+        for (value, level) in [
+            ("", InjectLevel::All),
+            ("all", InjectLevel::All),
+            (" no-handoff ", InjectLevel::NoHandoff),
+            ("none", InjectLevel::Nothing),
+            ("no_handoff", InjectLevel::Nothing),
+            ("ALL", InjectLevel::Nothing),
+            ("off", InjectLevel::Nothing),
+        ] {
+            let pairs: &'static [(&str, &str)] =
+                Box::leak(vec![(HOOK_INJECT_ENV, value)].into_boxed_slice());
+            assert_eq!(
+                InjectLevel::from_env_with(env_of(pairs)),
+                level,
+                "{value:?}"
+            );
+        }
+        assert_eq!(InjectLevel::All.event_query_suffix(), "");
+        assert_eq!(InjectLevel::Nothing.event_query_suffix(), "&inject=none");
+    }
+
+    #[test]
+    fn falsy_flags_are_added_once() {
+        assert_eq!(
+            with_falsy_flags("http://h/handoff?agent=codex".into(), &["handoff", "inbox"]),
+            "http://h/handoff?agent=codex&handoff=0&inbox=0",
+        );
+        // A marker's own delivery opt-out already sent `handoff=0`; a second
+        // copy would make the server answer 400.
+        assert_eq!(
+            with_falsy_flags(
+                "http://h/handoff?agent=codex&handoff=0&cwd=x".into(),
+                &["handoff", "inbox"]
+            ),
+            "http://h/handoff?agent=codex&handoff=0&cwd=x&inbox=0",
+        );
+        // A key that only shares a prefix is a different key.
+        assert_eq!(
+            with_falsy_flags("http://h/handoff?agent=a&handoffs=1".into(), &["handoff"]),
+            "http://h/handoff?agent=a&handoffs=1&handoff=0",
+        );
+    }
+
+    #[test]
+    fn the_role_wins_over_the_origin_and_an_unknown_role_falls_back() {
+        assert_eq!(
+            session_origin_query_suffix_with(env_of(&[
+                (SESSION_ORIGIN_ENV, "automation"),
+                (SESSION_ROLE_ENV, "qa"),
+            ])),
+            "&session_origin=qa",
+        );
+        assert_eq!(
+            session_origin_query_suffix_with(env_of(&[
+                (SESSION_ORIGIN_ENV, "automation"),
+                (SESSION_ROLE_ENV, "planner"),
+            ])),
+            "&session_origin=automation",
+        );
+        assert_eq!(
+            session_origin_query_suffix_with(env_of(&[(SESSION_ROLE_ENV, "Reviewer")])),
+            "",
+        );
+    }
+
+    #[test]
+    fn the_label_marker_is_scrubbed_bounded_and_skipped_when_blank() {
+        let privacy = ai_memory_core::SanitizeConfig::default();
+        let now: jiff::Timestamp = "2026-11-20T12:00:00Z".parse().unwrap();
+        let marker = session_label_marker_with(
+            env_of(&[(SESSION_LABEL_ENV, "  LOCAL-ai-memory - JOB-26 ")]),
+            &privacy,
+            now,
+        )
+        .unwrap();
+        assert_eq!(marker["name"], "LOCAL-ai-memory - JOB-26");
+        assert_eq!(marker["updated_at"], "2026-11-20T12:00:00Z");
+        assert!(session_label_marker_with(env_of(&[]), &privacy, now).is_none());
+        assert!(
+            session_label_marker_with(env_of(&[(SESSION_LABEL_ENV, "   ")]), &privacy, now)
+                .is_none()
+        );
+        let long: &'static str = Box::leak("x".repeat(1000).into_boxed_str());
+        let pairs: &'static [(&str, &str)] =
+            Box::leak(vec![(SESSION_LABEL_ENV, long)].into_boxed_slice());
+        let marker = session_label_marker_with(env_of(pairs), &privacy, now).unwrap();
+        assert_eq!(marker["name"].as_str().unwrap().len(), 256);
+        let secret = session_label_marker_with(
+            env_of(&[(
+                SESSION_LABEL_ENV,
+                "job ghp_0123456789abcdefghijklmnopqrstuvwxyzAB",
+            )]),
+            &privacy,
+            now,
+        )
+        .unwrap();
+        assert!(
+            !secret["name"].as_str().unwrap().contains("ghp_0123456789"),
+            "{secret}"
+        );
     }
 
     #[test]
@@ -8995,6 +9251,280 @@ mod tests {
             !normal.contains("claim=0"),
             "a non-captured start still claims the baton: {normal}"
         );
+    }
+
+    /// Every request a hook run sent to a server answering `body`, plus the
+    /// files left in its spool.
+    async fn worker_hook_requests(
+        agent: &str,
+        event: &str,
+        body: &'static str,
+        payload: impl FnOnce(&Path) -> String,
+        env: &[(&str, &str)],
+    ) -> (Vec<String>, Vec<u8>, Vec<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", body).await;
+        let args = HookArgs {
+            event: event.into(),
+            agent: agent.into(),
+            server_url: base.clone(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+            expected_profile: None,
+        };
+        let data = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        run_with_payload_in_home(
+            Some(data.clone()),
+            args,
+            payload(tmp.path()),
+            &mut stdout,
+            |_, _| Ok(()),
+            None,
+            RuntimeEnv::with_process_env_for_tests(env),
+        )
+        .await
+        .unwrap();
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        let spooled = fs::read_dir(hook_spool::spool_dir(&data))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (recorded, stdout, spooled)
+    }
+
+    fn worker_session_payload(cwd: &Path) -> String {
+        serde_json::json!({ "session_id": "worker", "cwd": cwd }).to_string()
+    }
+
+    /// `AI_MEMORY_HOOK_INJECT=none` closes every context front door: no
+    /// `/handoff`, `/brief`, `/recap` or anchor request leaves the hook, so a
+    /// pending baton is neither read nor claimed, while the event itself is
+    /// still captured and carries the level for the server log. The control
+    /// run without the variable fetches the handoff as before.
+    #[tokio::test]
+    async fn inject_none_sends_no_context_request_at_any_front_door() {
+        type Payload = fn(&Path) -> String;
+        let none = [("AI_MEMORY_HOOK_INJECT", "none")];
+        let hermes: Payload = |cwd| hermes_payload("pre_llm_call", cwd, pre_llm_call_extra(true));
+        let grok: Payload = |cwd| {
+            serde_json::json!({ "session_id": "worker", "cwd": cwd, "tool_name": "read_file" })
+                .to_string()
+        };
+        let session: Payload = worker_session_payload;
+        for (agent, event, payload) in [
+            ("claude-code", "session-start", session),
+            ("codex", "session-start", session),
+            ("kimi-code", "user-prompt-submit", session),
+            ("hermes", "user-prompt-submit", hermes),
+            ("grok", "post-tool-use", grok),
+        ] {
+            let (recorded, stdout, _) =
+                worker_hook_requests(agent, event, "OPERATOR-HANDOFF", payload, &none).await;
+            assert!(
+                !recorded.iter().any(|request| request.starts_with("GET ")),
+                "{agent}/{event} sent a context request: {recorded:?}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&stdout).contains("OPERATOR-HANDOFF"),
+                "{agent}/{event} injected the handoff"
+            );
+        }
+
+        let (recorded, _, spooled) = worker_hook_requests(
+            "claude-code",
+            "session-start",
+            "OPERATOR-HANDOFF",
+            worker_session_payload,
+            &none,
+        )
+        .await;
+        let captured = recorded
+            .iter()
+            .chain(spooled.iter())
+            .any(|event| event.contains("event=session-start") && event.contains("inject=none"));
+        assert!(
+            captured,
+            "the event is still captured, with the level: {recorded:?} {spooled:?}"
+        );
+
+        let (control, stdout, _) = worker_hook_requests(
+            "claude-code",
+            "session-start",
+            "OPERATOR-HANDOFF",
+            worker_session_payload,
+            &[],
+        )
+        .await;
+        assert!(
+            control
+                .iter()
+                .any(|request| request.starts_with("GET /handoff?")),
+            "{control:?}"
+        );
+        assert!(String::from_utf8_lossy(&stdout).contains("OPERATOR-HANDOFF"));
+    }
+
+    /// A typo in the level fails closed, like `none`.
+    #[tokio::test]
+    async fn an_unknown_inject_level_sends_no_context_request() {
+        let (recorded, _, _) = worker_hook_requests(
+            "claude-code",
+            "session-start",
+            "OPERATOR-HANDOFF",
+            worker_session_payload,
+            &[("AI_MEMORY_HOOK_INJECT", "no_handoff")],
+        )
+        .await;
+        assert!(
+            !recorded.iter().any(|request| request.starts_with("GET ")),
+            "{recorded:?}"
+        );
+    }
+
+    /// `no-handoff` keeps the start's context but asks the server to leave the
+    /// baton and the inbox notice out, and never closes the interrupted
+    /// session a recovery snapshot names: the backfill marker is stripped from
+    /// the injected text and no synthetic `session-end` reaches the spool. The
+    /// control run without the variable spools that close, which is the
+    /// behaviour a worker must not inherit.
+    #[tokio::test]
+    async fn inject_no_handoff_withholds_the_baton_and_never_closes_the_interrupted_session() {
+        let body: &'static str = Box::leak(
+            format!(
+                "RECOVERY-SNAPSHOT\n{prefix}session_id=operator-interrupted agent_kind=claude-code cwd= -->\nrest\n",
+                prefix = ai_memory_hooks::BACKFILL_MARKER_PREFIX,
+            )
+            .into_boxed_str(),
+        );
+        let (recorded, stdout, spooled) = worker_hook_requests(
+            "claude-code",
+            "session-start",
+            body,
+            worker_session_payload,
+            &[("AI_MEMORY_HOOK_INJECT", "no-handoff")],
+        )
+        .await;
+        let handoff = recorded
+            .iter()
+            .find(|request| request.starts_with("GET /handoff?"))
+            .unwrap_or_else(|| panic!("no-handoff still fetches the start context: {recorded:?}"));
+        let request_line = handoff.lines().next().unwrap_or_default();
+        assert!(request_line.contains("&handoff=0"), "{request_line}");
+        assert!(request_line.contains("&inbox=0"), "{request_line}");
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(
+            stdout.contains("RECOVERY-SNAPSHOT"),
+            "recovery is delivered: {stdout}"
+        );
+        assert!(
+            !stdout.contains(ai_memory_hooks::BACKFILL_MARKER_PREFIX),
+            "the marker never reaches the worker: {stdout}"
+        );
+        assert!(
+            !spooled
+                .iter()
+                .any(|entry| entry.contains("operator-interrupted")),
+            "a worker closed the operator's interrupted session: {spooled:?}"
+        );
+
+        let (_, _, control) = worker_hook_requests(
+            "claude-code",
+            "session-start",
+            body,
+            worker_session_payload,
+            &[],
+        )
+        .await;
+        assert!(
+            control
+                .iter()
+                .any(|entry| entry.contains("operator-interrupted")),
+            "control: an ordinary start closes the interrupted session: {control:?}"
+        );
+    }
+
+    /// `no-handoff` silences the Claude Code per-prompt inbox notice too.
+    #[tokio::test]
+    async fn inject_no_handoff_skips_the_prompt_inbox_notice() {
+        let payload = |cwd: &Path| {
+            fs::write(
+                cwd.join(".ai-memory.toml"),
+                "[messaging]\ninbox_notice_on_prompt = true\n",
+            )
+            .unwrap();
+            serde_json::json!({ "session_id": "worker", "cwd": cwd, "prompt": "go" }).to_string()
+        };
+        let (recorded, _, _) = worker_hook_requests(
+            "claude-code",
+            "user-prompt-submit",
+            "INBOX-NOTICE",
+            payload,
+            &[("AI_MEMORY_HOOK_INJECT", "no-handoff")],
+        )
+        .await;
+        assert!(
+            !recorded
+                .iter()
+                .any(|request| request.contains("inbox_only=1")),
+            "{recorded:?}"
+        );
+        let (control, _, _) = worker_hook_requests(
+            "claude-code",
+            "user-prompt-submit",
+            "INBOX-NOTICE",
+            payload,
+            &[],
+        )
+        .await;
+        assert!(
+            control
+                .iter()
+                .any(|request| request.contains("inbox_only=1")),
+            "control: {control:?}"
+        );
+    }
+
+    /// The role and the label reach the captured event: the role as the
+    /// session origin (winning over `AI_MEMORY_SESSION_ORIGIN`), the label as
+    /// the display-name marker.
+    #[tokio::test]
+    async fn the_worker_role_and_label_ride_the_captured_event() {
+        let (recorded, _, spooled) = worker_hook_requests(
+            "claude-code",
+            "session-start",
+            "",
+            worker_session_payload,
+            &[
+                ("AI_MEMORY_HOOK_INJECT", "none"),
+                ("AI_MEMORY_SESSION_ORIGIN", "automation"),
+                ("AI_MEMORY_SESSION_ROLE", "reviewer"),
+                ("AI_MEMORY_SESSION_LABEL", "LOCAL-ai-memory - JOB-26"),
+            ],
+        )
+        .await;
+        let event = recorded
+            .iter()
+            .chain(spooled.iter())
+            .find(|event| event.contains("event=session-start"))
+            .unwrap_or_else(|| panic!("no captured event: {recorded:?} {spooled:?}"));
+        assert!(event.contains("session_origin=reviewer"), "{event}");
+        assert!(!event.contains("session_origin=automation"), "{event}");
+        assert!(
+            event.contains(ai_memory_hooks::session_name::MARKER),
+            "{event}"
+        );
+        assert!(event.contains("LOCAL-ai-memory - JOB-26"), "{event}");
     }
 
     #[tokio::test]

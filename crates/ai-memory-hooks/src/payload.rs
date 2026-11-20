@@ -111,6 +111,11 @@ pub struct HookQuery {
     /// ordinary interactive session. Stamped on the session row so the profile
     /// harvester can be told to skip automation sessions' prompts.
     pub session_origin: Option<String>,
+    /// Context-injection level the host hook read from
+    /// `AI_MEMORY_HOOK_INJECT` (`no-handoff` or `none`; `all` is never sent).
+    /// Logged only, so an orchestrator can prove the variable reached the
+    /// hook process; the client alone acts on it.
+    pub inject: Option<String>,
     /// Invocation-scoped opt-out of the automatic handoff, forwarded by the
     /// host hook from `AI_MEMORY_AUTO_HANDOFF` (#1951). An explicit falsy
     /// value keeps this session's end or turn checkpoint from leaving a
@@ -208,6 +213,9 @@ pub struct HookEnvelope {
     /// ordinary interactive session (#2180). Stamped on the session row so the
     /// profile harvester can skip automation sessions' prompts.
     pub session_origin: Option<ai_memory_core::SessionOrigin>,
+    /// Validated `inject` level (`no-handoff` or `none`) the host hook read,
+    /// for the server log only.
+    pub hook_inject: Option<&'static str>,
     /// Whether this execution opted out of the automatic handoff (the
     /// `auto_handoff=0` query flag, from `AI_MEMORY_AUTO_HANDOFF`, #1951).
     pub auto_handoff_off: bool,
@@ -274,6 +282,7 @@ impl std::fmt::Debug for HookEnvelope {
             )
             .field("managed_run", &self.managed_run)
             .field("session_origin", &self.session_origin)
+            .field("hook_inject", &self.hook_inject)
             .field("auto_handoff_off", &self.auto_handoff_off)
             .field(
                 "capture_assistant_requested",
@@ -780,6 +789,11 @@ impl HookEnvelope {
             .session_origin
             .as_deref()
             .and_then(ai_memory_core::SessionOrigin::parse_wire);
+        let hook_inject = match query.inject.as_deref().map(str::trim) {
+            Some("no-handoff") => Some("no-handoff"),
+            Some("none") => Some("none"),
+            _ => None,
+        };
         let auto_handoff_off = query_flag_falsy(query.auto_handoff.as_deref());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
@@ -876,6 +890,7 @@ impl HookEnvelope {
             all_owners_requested,
             managed_run,
             session_origin,
+            hook_inject,
             auto_handoff_off,
             capture_assistant_requested,
             ingest_key,
