@@ -49,3 +49,9 @@ The server accepts `inbox=0` on `GET /handoff` and logs each worker start
 (`orchestrated session start`). `ai-memory capabilities --json` reports the
 supported values, since the fork keeps upstream's version number. No schema
 migration is added, so upstream migrations keep applying in order.
+
+### `custom/capabilities-build`
+
+`ai-memory capabilities` also reports `"build": "ownercode"` and
+`"repository": "https://github.com/NetoMouraJs/ai-memory"`, so a launcher can
+tell this build from upstream's without inferring it from the worker fields.
