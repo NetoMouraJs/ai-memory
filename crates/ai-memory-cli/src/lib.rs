@@ -147,6 +147,9 @@ async fn dispatch(
         }
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::Capabilities(args) => commands::capabilities::run(&args),
+        Command::Service(args) => {
+            commands::service::run(&config, args, config_path.as_deref()).await
+        }
         Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
         Command::Backfill(args) => commands::backfill::run(&config, args).await,
