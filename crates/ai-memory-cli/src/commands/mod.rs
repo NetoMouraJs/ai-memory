@@ -114,6 +114,7 @@ pub(crate) mod run_project_split;
 pub mod search;
 pub mod serve;
 pub mod server;
+pub mod service;
 pub mod service_host;
 pub mod session_usage;
 pub mod setup;

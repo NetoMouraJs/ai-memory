@@ -25,6 +25,7 @@ pub fn report() -> serde_json::Value {
         "hook_inject_env": InjectLevel::TOKENS,
         "session_role_env": roles,
         "session_label_env": true,
+        "service_control": cfg!(windows),
     })
 }
 
@@ -53,6 +54,7 @@ pub fn run(args: &CapabilitiesArgs) -> anyhow::Result<()> {
             .collect();
         writeln!(stdout, "session_role_env: {}", roles.join(", "))?;
         writeln!(stdout, "session_label_env: true")?;
+        writeln!(stdout, "service_control: {}", cfg!(windows))?;
     }
     Ok(())
 }
@@ -71,6 +73,7 @@ mod tests {
                 "hook_inject_env": ["all", "no-handoff", "none"],
                 "session_role_env": ["automation", "builder", "reviewer", "qa"],
                 "session_label_env": true,
+                "service_control": cfg!(windows),
             })
         );
     }

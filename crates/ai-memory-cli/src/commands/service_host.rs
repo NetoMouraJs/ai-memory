@@ -292,6 +292,50 @@ pub(crate) fn install_args(config: &Config, config_path: Option<&Path>) -> Vec<s
     args
 }
 
+/// One Windows command line for `exe` and `args`, quoted the way the C
+/// runtime splits it again, for a launcher that takes a single string.
+///
+/// # Errors
+/// When the program or an argument is not valid UTF-8.
+fn command_line(exe: &Path, args: &[std::ffi::OsString]) -> Result<String> {
+    std::iter::once(exe.as_os_str())
+        .chain(args.iter().map(std::ffi::OsString::as_os_str))
+        .map(|part| {
+            part.to_str()
+                .map(quote_windows_arg)
+                .with_context(|| format!("{} is not valid UTF-8", part.to_string_lossy()))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join(" "))
+}
+
+/// `arg` quoted when it holds a space, a tab or a quote, or is empty, with
+/// the backslashes before a quote (and before the closing quote) doubled.
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    let mut quoted = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = if c == '"' {
+            backslashes * 2 + 1
+        } else {
+            backslashes
+        };
+        quoted.extend(std::iter::repeat_n('\\', escaped));
+        quoted.push(c);
+        backslashes = 0;
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 /// `path` without a `\\?\` verbatim prefix. A path that is not UTF-8 is
 /// passed as it is.
 fn plain_arg(path: &Path) -> std::ffi::OsString {
@@ -405,20 +449,73 @@ mod windows {
         command
     }
 
+    const POWERSHELL: &str = "powershell.exe";
+    /// The environment variable that hands [`WMI_CREATE_SCRIPT`] the command
+    /// line, so no part of it is parsed as PowerShell.
+    pub(super) const WMI_COMMAND_LINE_ENV: &str = "AI_MEMORY_SERVICE_HOST_COMMAND_LINE";
+    /// Create the process through WMI with its window hidden (`SW_HIDE`) and
+    /// the caller's environment, which a WMI-created process does not
+    /// inherit (the `AI_MEMORY_*` settings among it), exiting with
+    /// `Win32_Process.Create`'s return value (0 on success).
+    pub(super) const WMI_CREATE_SCRIPT: &str = "$commandLine = $env:AI_MEMORY_SERVICE_HOST_COMMAND_LINE; \
+        Remove-Item Env:AI_MEMORY_SERVICE_HOST_COMMAND_LINE; \
+        $environment = [string[]](Get-ChildItem Env: | ForEach-Object { $_.Name + '=' + $_.Value }); \
+        $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly \
+        -Property @{ ShowWindow = [uint16]0; EnvironmentVariables = $environment }; \
+        $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create \
+        -Arguments @{ CommandLine = $commandLine; ProcessStartupInformation = $startup }; \
+        exit [int]$result.ReturnValue";
+
     /// Start the supervisor with no console, out of whatever job started the
-    /// logon entry when the job allows it, and do not wait for it.
+    /// logon entry, and do not wait for it.
+    ///
+    /// A job that forbids breakaway (the terminal of an IDE or an agent app)
+    /// would keep the supervisor and its server, and kill them when that app
+    /// closes. WMI creates the process outside the caller's job, so it gets
+    /// the supervisor there; only when that fails too does the supervisor
+    /// start inside the job.
     pub(super) fn spawn_detached(exe: &Path, args: &[OsString]) -> Result<()> {
         let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
         match command(exe, args, flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {
             Ok(_) => Ok(()),
             Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
-                command(exe, args, flags)
-                    .spawn()
-                    .map(|_| ())
-                    .map_err(Into::into)
+                if let Err(wmi_error) = spawn_through_wmi(exe, args) {
+                    tracing::warn!(
+                        error = %format!("{wmi_error:#}"),
+                        "service-host: the caller's job forbids breakaway and WMI could not \
+                         start the host; it runs inside the job and stops when the job closes"
+                    );
+                    return command(exe, args, flags)
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(Into::into);
+                }
+                Ok(())
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn spawn_through_wmi(exe: &Path, args: &[OsString]) -> Result<()> {
+        let command_line = super::command_line(exe, args)?;
+        let status = Command::new(POWERSHELL)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WMI_CREATE_SCRIPT,
+            ])
+            .env(WMI_COMMAND_LINE_ENV, command_line)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("running {POWERSHELL}"))?;
+        if !status.success() {
+            anyhow::bail!("Win32_Process.Create failed ({status})");
+        }
+        Ok(())
     }
 
     /// Run the server on a hidden console of its own, which the processes it
@@ -847,6 +944,61 @@ mod tests {
             ["--data-dir", r"\\server\share\ai memory"]
                 .map(std::ffi::OsString::from)
                 .to_vec()
+        );
+    }
+
+    /// The single string a WMI launch takes splits back into the same
+    /// program and arguments: spaces are quoted, quotes escaped, and the
+    /// backslashes before a quote or the closing quote doubled.
+    #[test]
+    fn the_command_line_quotes_only_what_the_c_runtime_would_split() {
+        assert_eq!(quote_windows_arg("service-host"), "service-host");
+        assert_eq!(quote_windows_arg(r"C:\a\b"), r"C:\a\b");
+        assert_eq!(quote_windows_arg(""), r#""""#);
+        assert_eq!(
+            quote_windows_arg(r"C:\Program Files\ai memory"),
+            r#""C:\Program Files\ai memory""#
+        );
+        assert_eq!(
+            quote_windows_arg(r"C:\dir with space\"),
+            r#""C:\dir with space\\""#
+        );
+        assert_eq!(quote_windows_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_windows_arg(r#"a\"b"#), r#""a\\\"b""#);
+
+        let line = command_line(
+            Path::new(r"C:\Users\me\AppData\Local\Programs\ai-memory\ai-memory.exe"),
+            &[
+                "--data-dir",
+                r"C:\Users\me\My Data",
+                "service-host",
+                "--supervise",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            r#"C:\Users\me\AppData\Local\Programs\ai-memory\ai-memory.exe --data-dir "C:\Users\me\My Data" service-host --supervise"#
+        );
+    }
+
+    /// The script reads the command line from the variable the launcher
+    /// sets, never from text spliced into the script, keeps that variable out
+    /// of the host, and hands the host the rest of the caller's environment.
+    #[cfg(windows)]
+    #[test]
+    fn the_wmi_script_reads_the_command_line_and_forwards_the_environment() {
+        let script = windows::WMI_CREATE_SCRIPT;
+        let variable = windows::WMI_COMMAND_LINE_ENV;
+        assert!(script.contains(&format!("$env:{variable}")), "{script}");
+        assert!(
+            script.contains(&format!("Remove-Item Env:{variable}")),
+            "{script}"
+        );
+        assert!(
+            script.contains("EnvironmentVariables = $environment"),
+            "{script}"
         );
     }
 

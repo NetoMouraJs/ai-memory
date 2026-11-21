@@ -164,6 +164,9 @@ pub enum Command {
     /// injection levels, session role and label), so an orchestrator can
     /// detect them when the version number alone does not tell.
     Capabilities(CapabilitiesArgs),
+    /// Start, stop or inspect the Windows background service `setup`
+    /// registers at logon.
+    Service(ServiceArgs),
     /// List every workspace/project pair the server knows about (plain,
     /// scriptable output — the read-only equivalent of hitting
     /// `GET /api/v1/projects` directly, falling back to `GET /admin/projects`
@@ -2216,6 +2219,36 @@ pub struct StatusArgs {
 #[derive(Debug, Args)]
 pub struct CapabilitiesArgs {
     /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `service`.
+#[derive(Debug, Args)]
+pub struct ServiceArgs {
+    /// Service action to run.
+    #[command(subcommand)]
+    pub command: ServiceCommand,
+}
+
+/// Subcommands for `service`.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Start the service outside the caller's job and wait for its server to
+    /// answer; a running service is left alone.
+    Start,
+    /// Stop the service and its server; the logon entry stays, so the next
+    /// logon starts it again.
+    Stop,
+    /// Show whether the service runs, its pids, and whether its server
+    /// answers.
+    Status(ServiceStatusArgs),
+}
+
+/// Arguments for `service status`.
+#[derive(Debug, Args)]
+pub struct ServiceStatusArgs {
+    /// Emit the status as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,
 }

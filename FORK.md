@@ -55,3 +55,24 @@ migration is added, so upstream migrations keep applying in order.
 `ai-memory capabilities` also reports `"build": "ownercode"` and
 `"repository": "https://github.com/NetoMouraJs/ai-memory"`, so a launcher can
 tell this build from upstream's without inferring it from the worker fields.
+
+### `custom/service-control`
+
+`ai-memory service start|stop|status [--json]` controls the Windows logon host
+(`service-host`) without waiting for the next logon or killing it by pid:
+
+- `stop` is the host's cooperative stop (`service-host.stop`, `taskkill` only
+  after 10 s without an answer); the `Run` entry stays.
+- `start` leaves a running host alone, refuses when another server already
+  answers on the configured URL, and otherwise starts the host and waits up
+  to 30 s for its server to answer.
+- `status --json` prints `running`, `supervisor_pid`, `server_pid`,
+  `responding` and `server_url`.
+
+When the caller's job forbids breakaway (the terminal of an IDE or an agent
+app), `service-host` now starts the supervisor through WMI
+(`Win32_Process.Create`, window hidden), which places it outside that job.
+Before, the supervisor stayed in the job and the app closing killed the
+server with no log line. It still falls back to starting inside the job,
+with a warning, when WMI fails. `capabilities` reports `"service_control"`
+(true on Windows).

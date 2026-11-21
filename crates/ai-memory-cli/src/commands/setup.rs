@@ -1069,7 +1069,7 @@ fn web_sign_in_hint(config: &Config, endpoint: &ServerEndpoint) -> Option<String
     ))
 }
 
-async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> bool {
+pub(crate) async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if matches!(probe_server(endpoint).await, ServerProbe::Reachable) {
