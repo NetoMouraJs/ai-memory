@@ -6,6 +6,12 @@
 use crate::cli::CapabilitiesArgs;
 use crate::commands::hook::InjectLevel;
 
+/// Names this build apart from upstream's, which keeps the same version
+/// number.
+const BUILD: &str = "ownercode";
+/// Where this build's source lives.
+const REPOSITORY: &str = "https://github.com/NetoMouraJs/ai-memory";
+
 /// The report, as one JSON object.
 #[must_use]
 pub fn report() -> serde_json::Value {
@@ -14,6 +20,8 @@ pub fn report() -> serde_json::Value {
         .map(|origin| origin.as_str())
         .collect();
     serde_json::json!({
+        "build": BUILD,
+        "repository": REPOSITORY,
         "hook_inject_env": InjectLevel::TOKENS,
         "session_role_env": roles,
         "session_label_env": true,
@@ -32,6 +40,8 @@ pub fn run(args: &CapabilitiesArgs) -> anyhow::Result<()> {
     if args.json {
         writeln!(stdout, "{report}")?;
     } else {
+        writeln!(stdout, "build: {BUILD}")?;
+        writeln!(stdout, "repository: {REPOSITORY}")?;
         writeln!(
             stdout,
             "hook_inject_env: {}",
@@ -52,10 +62,12 @@ mod tests {
     use super::report;
 
     #[test]
-    fn the_report_names_every_level_role_and_the_label() {
+    fn the_report_names_the_build_and_every_level_role_and_the_label() {
         assert_eq!(
             report(),
             serde_json::json!({
+                "build": "ownercode",
+                "repository": "https://github.com/NetoMouraJs/ai-memory",
                 "hook_inject_env": ["all", "no-handoff", "none"],
                 "session_role_env": ["automation", "builder", "reviewer", "qa"],
                 "session_label_env": true,
