@@ -76,3 +76,10 @@ Before, the supervisor stayed in the job and the app closing killed the
 server with no log line. It still falls back to starting inside the job,
 with a warning, when WMI fails. `capabilities` reports `"service_control"`
 (true on Windows).
+
+### `custom/idle-end-interval`
+
+The idle-session auto-end tick (`[sessions] idle_end_after_hours`) scans once
+an hour instead of every 15 minutes (`IDLE_END_INTERVAL_SECS`). A session
+idle past the cutoff now ends up to an hour after it, not up to 15 minutes;
+the cutoff itself is still the config value.

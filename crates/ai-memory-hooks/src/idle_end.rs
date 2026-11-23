@@ -59,7 +59,7 @@ pub const IDLE_END_BATCH: usize = 25;
 /// Fixed tick interval. The scan is stateless and idempotent (the
 /// `ended_at IS NULL` CAS plus the conditional page write make a double
 /// end impossible), so a fixed interval needs no persisted cadence state.
-pub const IDLE_END_INTERVAL_SECS: u64 = 15 * 60;
+pub const IDLE_END_INTERVAL_SECS: u64 = 60 * 60;
 
 /// What one idle auto-end tick did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
